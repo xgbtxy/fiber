@@ -429,12 +429,14 @@ func (s *Session) refresh() {
 
 // valuesMu serializes what this package writes to the values of a request from a
 // goroutine that need not be the one serving it: the new ID that Regenerate and Reset
-// cache there, and the entry that ends the request for the session of an unwound
-// middleware. fasthttp appends to those values without a lock, so of two such writes at
-// once one is lost, and a session whose entry is lost is never told that its request
-// ended. Two sessions of a request have a lock each for their own writes (reqMu), which
-// is why this one is shared; nothing but those writes is done under it. What the
-// application writes to the same values from a goroutine of its own is not covered.
+// cache there, the entry that ends the request for the session of an unwound
+// middleware, and the marks a cache reads (the header a session ID travels in, and a
+// withheld cookie). fasthttp appends to those values without a lock, so of two such
+// writes at once one is lost: a session whose entry is lost is never told that its
+// request ended, and a lost mark lets the cache store the response. Two sessions of a
+// request have a lock each for their own writes (reqMu), which is why this one is
+// shared; nothing but those writes is done under it. What the application writes to the
+// same values from a goroutine of its own is not covered.
 var valuesMu sync.Mutex
 
 // recache tells the request of the session that its ID is no longer old: a store that is
@@ -698,7 +700,10 @@ func (s *Session) setSession(ttl time.Duration) {
 			resp.Header.SetBytesV(ext.Key, utils.UnsafeBytes(s.id))
 			// The header holds this client's session, so a middleware that keeps the
 			// response for other clients must leave it out, as it does Set-Cookie.
+			// Under valuesMu, as markCookieWithheld: a session may run on a goroutine of its own.
+			valuesMu.Lock()
 			personalheader.Mark(s.fasthttpCtx(), s.config.places().headers)
+			valuesMu.Unlock()
 		case extractors.SourceCookie:
 			fcookie := fasthttp.AcquireCookie()
 
@@ -724,19 +729,29 @@ func (s *Session) setSession(ttl time.Duration) {
 
 // withholdCookie marks the response as the client's own when it goes out without the cookie
 // setSession writes, so the cache middleware registered before this one keeps it out as it
-// keeps out one that sets the cookie: the handler built it from the session all the same. With a cookie among the sinks,
-// every response the middleware serves then either sets the cookie or carries the mark, short
-// of one for an empty session SkipEmptySessions leaves unsaved, one the timeout middleware
-// gave up on and one a panic unwound. The caller holds s.mu.
+// keeps out one that sets the cookie: the handler built it from the session all the same.
+// With a cookie among the sinks, every response the middleware serves then either sets the
+// cookie or carries the mark, short of one for an empty session SkipEmptySessions leaves
+// unsaved, one the timeout middleware gave up on and one a panic unwound. The caller holds s.mu.
 func (s *Session) withholdCookie() {
 	s.reqMu.Lock()
 	defer s.reqMu.Unlock()
 	if _, resp := s.requestResponse(); resp == nil {
 		return
 	}
-	for _, ext := range s.getExtractorInfo() {
+	markCookieWithheld(s.fasthttpCtx(), s.getExtractorInfo())
+}
+
+// markCookieWithheld marks the response to the request of rctx as one that goes out without
+// the cookie among sinks, if there is one. The session that marks it may run on a goroutine
+// of its own, so the write shares the lock of this package's other writes to the values of
+// the request (valuesMu): of two writes at once one is lost.
+func markCookieWithheld(rctx *fasthttp.RequestCtx, sinks []extractors.Extractor) {
+	for _, ext := range sinks {
 		if ext.Source == extractors.SourceCookie {
-			personalheader.MarkCookieWithheld(s.fasthttpCtx())
+			valuesMu.Lock()
+			personalheader.MarkCookieWithheld(rctx)
+			valuesMu.Unlock()
 			return
 		}
 	}
