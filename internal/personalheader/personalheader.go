@@ -4,6 +4,11 @@
 // responses to give them to other clients, as the cache does, leaves it out. A stored
 // copy that kept it would hand the session of the client that caused the miss to every
 // client that hits the entry, which is why Set-Cookie is never stored either.
+//
+// A middleware that leaves out the cookie it writes on every other response, as the
+// session middleware does for a session another request ended meanwhile, marks that
+// too: the response is still the one client's, and is kept out as one that sets the
+// cookie is.
 package personalheader
 
 import (
@@ -79,6 +84,29 @@ func Mark(rctx *fasthttp.RequestCtx, names *Names) {
 		rctx.SetUserValue(key{}, New(append(append([]string(nil), marked.names...), names.names...)...))
 	default:
 	}
+}
+
+// withheldKey is the request value that records a withheld cookie, beside the marked names.
+type withheldKey struct{}
+
+// MarkCookieWithheld records that the response to the request of rctx goes out without
+// the cookie a middleware writes for the client that sent it, which a middleware that
+// keeps responses for other clients must take as it takes a response that sets one.
+func MarkCookieWithheld(rctx *fasthttp.RequestCtx) {
+	if rctx == nil {
+		return
+	}
+	rctx.SetUserValue(withheldKey{}, true)
+}
+
+// CookieWithheld reports whether the response to the request of rctx was marked with
+// MarkCookieWithheld.
+func CookieWithheld(rctx *fasthttp.RequestCtx) bool {
+	if rctx == nil {
+		return false
+	}
+	withheld, ok := rctx.UserValue(withheldKey{}).(bool)
+	return ok && withheld
 }
 
 // Marked returns the names that were marked for the request of rctx, or nil.

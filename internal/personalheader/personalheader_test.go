@@ -62,3 +62,29 @@ func Test_Mark(t *testing.T) {
 		require.Nil(t, Marked(rctx))
 	})
 }
+
+func Test_MarkCookieWithheld(t *testing.T) {
+	t.Parallel()
+	t.Run("nothing marked", func(t *testing.T) {
+		t.Parallel()
+		require.False(t, CookieWithheld(&fasthttp.RequestCtx{}))
+		require.False(t, CookieWithheld(nil))
+		MarkCookieWithheld(nil)
+	})
+	t.Run("marked", func(t *testing.T) {
+		t.Parallel()
+		rctx := &fasthttp.RequestCtx{}
+		MarkCookieWithheld(rctx)
+		require.True(t, CookieWithheld(rctx))
+		require.Nil(t, Marked(rctx), "the mark names no header")
+		MarkCookieWithheld(rctx)
+		require.True(t, CookieWithheld(rctx), "marking again changes nothing")
+	})
+	t.Run("the mark belongs to the request", func(t *testing.T) {
+		t.Parallel()
+		rctx := &fasthttp.RequestCtx{}
+		MarkCookieWithheld(rctx)
+		rctx.ResetUserValues()
+		require.False(t, CookieWithheld(rctx))
+	})
+}

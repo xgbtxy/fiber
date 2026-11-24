@@ -231,12 +231,15 @@ func (s *Session) DestroyWithContext(ctx context.Context) error {
 	defer s.mu.Unlock()
 
 	// The record the session took the place of goes first: a storage that fails there
-	// fails the call before the session's own record is touched.
+	// fails the call before the session's own record is touched. A destroy that fails
+	// sends no cookie, and the middleware saves no destroyed session: mark the response.
 	if err := s.deleteUnreadable(ctx); err != nil {
+		s.withholdCookie()
 		return err
 	}
 	// Use external Storage if exist
 	if err := s.config.deleteKey(ctx, s.storageKey()); err != nil {
+		s.withholdCookie()
 		return err
 	}
 
@@ -526,6 +529,7 @@ func (s *Session) saveSessionWithContext(ctx context.Context) error {
 	defer s.mu.Unlock()
 
 	if s.dropped {
+		s.withholdCookie()
 		return nil
 	}
 
@@ -553,6 +557,7 @@ func (s *Session) saveSessionWithContext(ctx context.Context) error {
 		}
 		s.data.RUnlock()
 		if err != nil {
+			s.withholdCookie()
 			return fmt.Errorf("failed to encode data: %w", err)
 		}
 		data = encoded
@@ -571,10 +576,12 @@ func (s *Session) saveSessionWithContext(ctx context.Context) error {
 		}
 		raw, moved, err := s.config.storedSince(ctx, key, s.loadGen)
 		if err != nil {
+			s.withholdCookie()
 			return err
 		}
 		if moved {
 			if raw == nil {
+				s.withholdCookie()
 				return nil // ended by another request: neither store it nor send its cookie again
 			}
 			if s.overtakenBy(raw) {
@@ -711,6 +718,26 @@ func (s *Session) setSession(ttl time.Duration) {
 			fasthttp.ReleaseCookie(fcookie)
 		default:
 			// For non-cookie/header sources, do nothing (read-only)
+		}
+	}
+}
+
+// withholdCookie marks the response as the client's own when it goes out without the cookie
+// setSession writes, so the cache middleware registered before this one keeps it out as it
+// keeps out one that sets the cookie: the handler built it from the session all the same. With a cookie among the sinks,
+// every response the middleware serves then either sets the cookie or carries the mark, short
+// of one for an empty session SkipEmptySessions leaves unsaved, one the timeout middleware
+// gave up on and one a panic unwound. The caller holds s.mu.
+func (s *Session) withholdCookie() {
+	s.reqMu.Lock()
+	defer s.reqMu.Unlock()
+	if _, resp := s.requestResponse(); resp == nil {
+		return
+	}
+	for _, ext := range s.getExtractorInfo() {
+		if ext.Source == extractors.SourceCookie {
+			personalheader.MarkCookieWithheld(s.fasthttpCtx())
+			return
 		}
 	}
 }

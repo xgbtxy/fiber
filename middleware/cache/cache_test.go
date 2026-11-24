@@ -1067,6 +1067,46 @@ func Test_SetCookieFromInnerMiddlewareIsSeen(t *testing.T) {
 	require.Equal(t, 2, calls, "the handler must run for both clients")
 }
 
+// Test_CookieWithheldByInnerMiddlewareIsSeen covers a middleware inside the cache that
+// sends a response without the cookie it writes on every other one, as the session
+// middleware does for a session another request ended meanwhile, and marks it so. The
+// cache takes the response as it takes one that sets the cookie: it stores it only when
+// the response says outright that a shared cache may hold it.
+func Test_CookieWithheldByInnerMiddlewareIsSeen(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, directive, first, second string
+		withheld                       bool
+	}{
+		{name: "not marked", first: cacheMiss, second: cacheHit},
+		{name: "marked", withheld: true, first: cacheUnreachable, second: cacheUnreachable},
+		{name: "marked, public", withheld: true, directive: "public", first: cacheMiss, second: cacheHit},
+		{name: "marked, s-maxage", withheld: true, directive: "s-maxage=60", first: cacheMiss, second: cacheHit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			app := fiber.New()
+			app.Use(New())
+			app.Use(func(c fiber.Ctx) error {
+				err := c.Next()
+				if tc.withheld {
+					personalheader.MarkCookieWithheld(c.RequestCtx())
+				}
+				return err
+			})
+			app.Get("/", func(c fiber.Ctx) error {
+				if tc.directive != "" {
+					c.Set(fiber.HeaderCacheControl, tc.directive)
+				}
+				return c.SendString("page")
+			})
+
+			cacheTestAExpect(t, app, "/", tc.first)
+			cacheTestAExpect(t, app, "/", tc.second)
+		})
+	}
+}
+
 // Test_StoreResponseHeaders_DropsSetCookie covers the opt-in path: a route that
 // says a shared cache may store the response is taken at its word, and then the
 // stored copy still leaves Set-Cookie out so the entry cannot hand the first

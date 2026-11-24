@@ -1267,6 +1267,90 @@ func Test_Session_Middleware_HeaderIDIsNotReplayedByTheCache(t *testing.T) {
 	}
 }
 
+// Behind the cache, the session middleware writes its cookie on every response it saves, and the
+// cache stores no response that sets one. A response it sends without the cookie, because another
+// request ended or rotated the session meanwhile, or because the save or a destroy failed, is
+// marked instead, and the cache keeps it out all the same: the handler built the page from the
+// session.
+func Test_Session_Middleware_WithheldCookieKeepsThePageOutOfTheCache(t *testing.T) {
+	t.Parallel()
+	errBoom := errors.New("boom")
+	for _, tc := range []struct {
+		interfere func(c fiber.Ctx, store *Store, mem *storagetest.Memory) error
+		name      string
+	}{
+		{name: "ended by another request", interfere: func(c fiber.Ctx, store *Store, _ *storagetest.Memory) error {
+			return store.Delete(context.Background(), FromContext(c).ID())
+		}},
+		{name: "rotated by another request", interfere: func(c fiber.Ctx, store *Store, _ *storagetest.Memory) error {
+			other, err := store.GetByID(context.Background(), FromContext(c).ID())
+			if err != nil {
+				return err
+			}
+			defer other.Release()
+			if err := other.Regenerate(); err != nil {
+				return err
+			}
+			return other.Save()
+		}},
+		{name: "regenerated after another request ended it", interfere: func(c fiber.Ctx, store *Store, _ *storagetest.Memory) error {
+			if err := store.Delete(context.Background(), FromContext(c).ID()); err != nil {
+				return err
+			}
+			return FromContext(c).Regenerate()
+		}},
+		{name: "the save cannot read the storage", interfere: func(c fiber.Ctx, store *Store, mem *storagetest.Memory) error {
+			mem.SetErr(storagetest.OpGet, "*", errBoom)
+			return store.Delete(context.Background(), FromContext(c).ID()) // so the save reads the storage again
+		}},
+		{name: "the save cannot encode the session", interfere: func(c fiber.Ctx, _ *Store, _ *storagetest.Memory) error {
+			FromContext(c).Set("channel", make(chan int)) // which gob cannot encode
+			return nil
+		}},
+		{name: "the destroy fails", interfere: func(c fiber.Ctx, _ *Store, mem *storagetest.Memory) error {
+			mem.SetErr(storagetest.OpDelete, "*", errBoom)
+			if err := FromContext(c).Destroy(); !errors.Is(err, errBoom) {
+				return fmt.Errorf("destroy returned %w, not the storage's error", err)
+			}
+			return nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			mem := storagetest.New()
+			// The error handler leaves the page as the handler wrote it, as one that only logs does.
+			handler, store := NewWithStore(Config{Storage: mem, ErrorHandler: func(fiber.Ctx, error) {}})
+			interfered := make(chan error, 1)
+			app := fiber.New()
+			app.Use(cache.New())
+			app.Use(handler)
+			app.Get("/login", func(c fiber.Ctx) error {
+				FromContext(c).Set("user", "user-1")
+				return c.SendString("ok")
+			})
+			app.Get("/account", func(c fiber.Ctx) error {
+				page := fmt.Sprintf("signed in as %v", FromContext(c).Get("user"))
+				if c.Get(fiber.HeaderCookie) != "" {
+					interfered <- tc.interfere(c, store, mem)
+				}
+				return c.SendString(page)
+			})
+
+			cookie := apptest.Do(t, app, "/login").Header.Get(fiber.HeaderSetCookie)
+			require.NotEmpty(t, cookie)
+			resp := apptest.Do(t, app, apptest.Req(fiber.MethodGet, "/account", apptest.WithHeader(fiber.HeaderCookie, cookie)))
+			require.NoError(t, apptest.Recv(t, interfered, 5*time.Second))
+			require.Equal(t, "signed in as user-1", apptest.Body(t, resp))
+			require.Empty(t, resp.Header.Get(fiber.HeaderSetCookie), "no cookie goes out, so only the mark keeps the page out")
+			require.Equal(t, "unreachable", resp.Header.Get("X-Cache"), "the cache stored the page of the session")
+
+			mem.ClearErrs()
+			other := apptest.Do(t, app, "/account")
+			require.NotEqual(t, "signed in as user-1", apptest.Body(t, other), "a client without the cookie read the page")
+		})
+	}
+}
+
 // The header sinks of a store are the names it marks as one client's.
 func Test_Session_Store_MarksOnlyItsHeaderSinks(t *testing.T) {
 	t.Parallel()
