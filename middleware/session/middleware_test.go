@@ -1351,6 +1351,48 @@ func Test_Session_Middleware_WithheldCookieKeepsThePageOutOfTheCache(t *testing.
 	}
 }
 
+// The mark stands for the cookie the middleware leaves out, so a session whose ID travels in
+// a header, which sets no cookie on any response, takes none when another request ends it.
+func Test_Session_Middleware_MarksOnlyAWithheldCookie(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		extractor extractors.Extractor
+		marked    bool
+	}{
+		{name: "cookie", extractor: extractors.FromCookie("session_id"), marked: true},
+		{name: "header", extractor: extractors.FromHeader("X-Session-ID")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			handler, store := NewWithStore(Config{Extractor: tc.extractor})
+			marked := make(chan bool, 1)
+			app := fiber.New()
+			app.Use(func(c fiber.Ctx) error {
+				err := c.Next()
+				marked <- personalheader.CookieWithheld(c.RequestCtx())
+				return err
+			})
+			app.Use(handler)
+			app.Get("/login", func(c fiber.Ctx) error {
+				FromContext(c).Set("user", "user-1")
+				return nil
+			})
+			app.Get("/account", func(c fiber.Ctx) error { return store.Delete(context.Background(), FromContext(c).ID()) })
+
+			login := apptest.Do(t, app, "/login")
+			require.False(t, apptest.Recv(t, marked, 5*time.Second), "a saved session is not marked")
+			req := apptest.Req(fiber.MethodGet, "/account",
+				apptest.WithHeaderIf(fiber.HeaderCookie, login.Header.Get(fiber.HeaderSetCookie)),
+				apptest.WithHeaderIf("X-Session-ID", login.Header.Get("X-Session-ID")))
+			resp := apptest.Expect(t, app, req, fiber.StatusOK)
+			require.Empty(t, resp.Header.Get(fiber.HeaderSetCookie), "the session ended: no new ID is sent")
+			require.Empty(t, resp.Header.Get("X-Session-ID"), "the session ended: no new ID is sent")
+			require.Equal(t, tc.marked, apptest.Recv(t, marked, 5*time.Second))
+		})
+	}
+}
+
 // The header sinks of a store are the names it marks as one client's.
 func Test_Session_Store_MarksOnlyItsHeaderSinks(t *testing.T) {
 	t.Parallel()
