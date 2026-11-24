@@ -1351,6 +1351,25 @@ func Test_Session_Middleware_WithheldCookieKeepsThePageOutOfTheCache(t *testing.
 	}
 }
 
+// When the storage cannot load the session the request names, the response goes out without
+// the cookie, and an ErrorHandler that only logs leaves it an empty 200: the mark keeps it out
+// of the cache, which would otherwise serve it to every client in place of the page.
+func Test_Session_Middleware_LoadFailureKeepsThePageOutOfTheCache(t *testing.T) {
+	t.Parallel()
+	mem := storagetest.New()
+	mem.SetErr(storagetest.OpGet, "*", errors.New("boom"))
+	app := fiber.New()
+	app.Use(cache.New())
+	app.Use(New(Config{Storage: mem, ErrorHandler: func(fiber.Ctx, error) {}}))
+	app.Get("/", func(c fiber.Ctx) error { return c.SendString("page") })
+
+	req := apptest.Req(fiber.MethodGet, "/", apptest.WithHeader(fiber.HeaderCookie, "session_id=abc"))
+	resp := apptest.Expect(t, app, req, fiber.StatusOK)
+	require.Empty(t, resp.Header.Get(fiber.HeaderSetCookie))
+	require.Equal(t, "unreachable", resp.Header.Get("X-Cache"), "the cache stored the page of a failed load")
+	require.Equal(t, "page", apptest.Body(t, apptest.Do(t, app, "/")), "a client without the cookie got the error page")
+}
+
 // The mark stands for the cookie the middleware leaves out, so a session whose ID travels in
 // a header, which sets no cookie on any response, takes none when another request ends it.
 func Test_Session_Middleware_MarksOnlyAWithheldCookie(t *testing.T) {

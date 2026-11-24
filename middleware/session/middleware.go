@@ -172,6 +172,10 @@ func NewWithStore(config ...Config) (fiber.Handler, *Store) {
 		if err := m.initialize(c, &cfg); err != nil {
 			releaseMiddleware(m)
 			handleSessionError(c, cfg.ErrorHandler, err)
+			// The session the request named could not be loaded, and the response, the
+			// ErrorHandler's, goes out without the cookie: one that leaves it a 200 must not
+			// have the cache registered before this middleware serve it to every client.
+			markCookieWithheld(c.RequestCtx(), cfg.Store.places().sinks)
 			return nil
 		}
 
