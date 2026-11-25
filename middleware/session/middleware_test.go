@@ -1412,6 +1412,58 @@ func Test_Session_Middleware_MarksOnlyAWithheldCookie(t *testing.T) {
 	}
 }
 
+// What this package writes to the values of a request takes valuesMu: fasthttp appends to them
+// without a lock, so a session that marks its response from a goroutine of its own would
+// otherwise lose the mark, or the entry the middleware writes at the same time. Only the race
+// detector tells the two apart: without -race this test passes either way.
+func Test_Session_RequestValueWritesShareTheLock(t *testing.T) {
+	t.Parallel()
+	sinks := []extractors.Extractor{extractors.FromCookie("session_id")}
+	for _, tc := range []struct {
+		write      func(c fiber.Ctx, m *Middleware, store *Store)
+		name       string
+		middleware bool
+	}{
+		{name: "storeMiddlewareContext", middleware: true, write: func(c fiber.Ctx, m *Middleware, _ *Store) {
+			storeMiddlewareContext(c, m.Session, m)
+		}},
+		{name: "restoreMiddlewareContext", middleware: true, write: func(c fiber.Ctx, m *Middleware, _ *Store) {
+			restoreMiddlewareContext(c, m)
+		}},
+		{name: "clearMiddlewareLocals", middleware: true, write: func(c fiber.Ctx, _ *Middleware, _ *Store) {
+			clearMiddlewareLocals(c)
+		}},
+		{name: "shadowMiddlewareContext", middleware: true, write: func(c fiber.Ctx, _ *Middleware, _ *Store) {
+			shadowMiddlewareContext(c)
+		}},
+		// The ID that Store.Get caches; the rest of Store.Get reads the request as Fiber does.
+		{name: "cacheNewID", write: func(c fiber.Ctx, _ *Middleware, store *Store) {
+			cacheNewID(c, store, &sessionIdentity{id: "session-id"})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			app := fiber.New(fiber.Config{PassLocalsToContext: true})
+			store := NewStore()
+			for range 3 {
+				c := app.AcquireCtx(&fasthttp.RequestCtx{})
+				var m *Middleware
+				if tc.middleware {
+					m = startMiddleware(t, c, store)
+				}
+				marked := make(chan struct{})
+				go func() {
+					defer close(marked)
+					markCookieWithheld(c.RequestCtx(), sinks)
+				}()
+				tc.write(c, m, store)
+				apptest.Recv(t, marked, 5*time.Second)
+				app.ReleaseCtx(c)
+			}
+		})
+	}
+}
+
 // The header sinks of a store are the names it marks as one client's.
 func Test_Session_Store_MarksOnlyItsHeaderSinks(t *testing.T) {
 	t.Parallel()
